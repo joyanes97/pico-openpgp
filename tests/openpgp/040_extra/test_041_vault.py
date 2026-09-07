@@ -14,6 +14,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import x448
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from pico_vault_enroller.crypto import _hpke_auth_encrypt
 
 
 VAULT_MAGIC = b"PKV\x01"
@@ -37,6 +38,7 @@ VAULT_FINISH_ENROLLMENT = 0x03
 VAULT_EXPORT = 0x04
 VAULT_IMPORT = 0x05
 VAULT_UNENROLL = 0x06
+VAULT_ENROLLMENT_PROTOCOL = 2
 
 OPENPGP_AID = bytes.fromhex("D27600012401")
 PIV_AID = bytes.fromhex("A000000308")
@@ -216,6 +218,15 @@ def _certificate_enrollment_packet(certificate, private_key, device_public, chal
     return struct.pack(">H", len(certificate)) + certificate + nonce + encrypted
 
 
+def _hpke_enrollment_packet(certificate, private_key, device_public, challenge, kvault, label):
+    label_bytes = label.encode()
+    if len(label_bytes) > 64:
+        raise ValueError("vault label is too long")
+    plain = kvault + bytes([len(label_bytes)]) + label_bytes
+    encrypted = _hpke_auth_encrypt(certificate, private_key, device_public, challenge, plain)
+    return struct.pack(">H", len(certificate)) + certificate + encrypted
+
+
 def _reader(card):
     return card._OpenPGP_Card__reader
 
@@ -292,10 +303,16 @@ def _live_enrollment(card):
     _select(card, OPENPGP_AID)
     password = os.environ.get("PICO_OPENPGP_VAULT_PW3", "12345678")
     assert card.verify(3, password.encode())
+    status, result = _raw(card, INS_VAULT, VAULT_STATUS, 0)
+    assert result == b"\x90\x00"
+    assert len(status) >= 37
+    protocol = status[37 + status[36]] if len(status) >= 38 + status[36] else 1
+    assert protocol in (1, VAULT_ENROLLMENT_PROTOCOL)
     response, result = _raw(card, INS_VAULT, VAULT_START_ENROLLMENT, 0)
     assert result == b"\x90\x00"
     assert len(response) == 56 + VAULT_ENROLL_CHALLENGE_BYTES
-    packet = _certificate_enrollment_packet(certificate, private_key, response[:56], response[56:], kvault, plain.get("label", ""))
+    packet_builder = _hpke_enrollment_packet if protocol == VAULT_ENROLLMENT_PROTOCOL else _certificate_enrollment_packet
+    packet = packet_builder(certificate, private_key, response[:56], response[56:], kvault, plain.get("label", ""))
     vault_id, result = _raw(card, INS_VAULT, VAULT_FINISH_ENROLLMENT, 0, packet)
     assert result == b"\x90\x00"
     assert len(vault_id) == VAULT_ID_BYTES
@@ -422,7 +439,9 @@ def test_live_openpgp_vault_status_contract(request):
     assert status[2] in (0, 1)
     assert status[3] in (0, VAULT_ID_BYTES)
     assert status[36] <= 64
-    assert len(status) == 37 + status[36]
+    assert len(status) in (37 + status[36], 38 + status[36])
+    if len(status) >= 38 + status[36]:
+        assert status[37 + status[36]] in (1, VAULT_ENROLLMENT_PROTOCOL)
 
 
 def test_live_vault_commands_require_openpgp_admin_pin(request):

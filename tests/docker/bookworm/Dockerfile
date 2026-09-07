@@ -31,7 +31,8 @@ RUN apt install -y libccid \
     tpm2-tools \
     swtpm \
     && rm -rf /var/lib/apt/lists/*
-RUN pip3 install pytest pycvc cryptography pyscard 'yubikey-manager>=5.6,<6' --break-system-packages
+RUN pip3 install pytest pycvc cryptography pyscard fido2 'yubikey-manager>=5.6,<6' --break-system-packages
+RUN pip3 install --break-system-packages git+https://github.com/polhenarejos/pico-vault-enroller.git
 RUN git clone https://github.com/Yubico/yubico-piv-tool
 WORKDIR /yubico-piv-tool
 RUN git checkout tags/yubico-piv-tool-2.5.1

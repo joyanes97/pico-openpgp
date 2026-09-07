@@ -470,7 +470,8 @@ int openpgp_vault_command(openpgp_vault_app_t app) {
         memcpy(res_APDU + 4, vault_id, sizeof(vault_id));
         res_APDU[36] = label_len;
         memcpy(res_APDU + 37, label, label_len);
-        res_APDU_size = 37 + label_len;
+        res_APDU[37 + label_len] = PICOKEYS_VAULT_ENROLLMENT_PROTOCOL;
+        res_APDU_size = 38 + label_len;
         mbedtls_platform_zeroize(kvault, sizeof(kvault));
         mbedtls_platform_zeroize(vault_id, sizeof(vault_id));
         mbedtls_platform_zeroize(label, sizeof(label));
