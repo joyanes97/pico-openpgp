@@ -569,6 +569,188 @@ static const file_object_txn_layout_t *pin_txn_layout(uint16_t fid) {
     return NULL;
 }
 
+typedef struct {
+    uint8_t offset;
+    uint8_t tag;
+    uint8_t length;
+} openpgp_kdf_field_t;
+
+static const uint8_t openpgp_kdf_off[] = { 0x81, 0x01, 0x00 };
+static const uint8_t openpgp_kdf_pw1_default[] = "123456";
+static const uint8_t openpgp_kdf_pw3_default[] = "12345678";
+static const openpgp_kdf_field_t openpgp_kdf_single_fields[] = {
+    { 0, 0x81, 1 },
+    { 3, 0x82, 1 },
+    { 6, 0x83, 4 },
+    { 12, 0x84, 8 },
+    { 22, 0x87, 32 },
+    { 56, 0x88, 32 },
+};
+static const openpgp_kdf_field_t openpgp_kdf_three_fields[] = {
+    { 0, 0x81, 1 },
+    { 3, 0x82, 1 },
+    { 6, 0x83, 4 },
+    { 12, 0x84, 8 },
+    { 22, 0x85, 8 },
+    { 32, 0x86, 8 },
+    { 42, 0x87, 32 },
+    { 76, 0x88, 32 },
+};
+
+static bool openpgp_kdf_parse(const uint8_t *data, size_t len, const uint8_t **pw1, const uint8_t **pw3) {
+    const openpgp_kdf_field_t *fields = NULL;
+    size_t field_count = 0;
+
+    if (len == sizeof(openpgp_kdf_off) && memcmp(data, openpgp_kdf_off, sizeof(openpgp_kdf_off)) == 0) {
+        *pw1 = openpgp_kdf_pw1_default;
+        *pw3 = openpgp_kdf_pw3_default;
+        return true;
+    }
+    if (len == 90) {
+        fields = openpgp_kdf_single_fields;
+        field_count = sizeof(openpgp_kdf_single_fields) / sizeof(fields[0]);
+    }
+    else if (len == 110) {
+        fields = openpgp_kdf_three_fields;
+        field_count = sizeof(openpgp_kdf_three_fields) / sizeof(fields[0]);
+    }
+    else {
+        return false;
+    }
+    for (size_t i = 0; i < field_count; i++) {
+        const openpgp_kdf_field_t *field = &fields[i];
+        if (data[field->offset] != field->tag || data[field->offset + 1] != field->length) {
+            return false;
+        }
+        if (field->tag == 0x87) {
+            *pw1 = data + field->offset + 2;
+        }
+        else if (field->tag == 0x88) {
+            *pw3 = data + field->offset + 2;
+        }
+    }
+    return *pw1 != NULL && *pw3 != NULL;
+}
+
+static bool openpgp_kdf_key_present(void) {
+    const uint16_t key_fids[] = { EF_PK_SIG, EF_PK_DEC, EF_PK_AUT };
+
+    for (size_t i = 0; i < sizeof(key_fids) / sizeof(key_fids[0]); i++) {
+        file_t *key = file_search_by_fid(key_fids[i], NULL, SPECIFY_EF);
+        if (key && file_has_data(key)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void openpgp_kdf_clear_auth(void) {
+    has_pw1 = false;
+    has_pw2 = false;
+    has_pw3 = false;
+    has_rc = false;
+    isUserAuthenticated = false;
+    mbedtls_platform_zeroize(session_pw1, sizeof(session_pw1));
+    mbedtls_platform_zeroize(session_rc, sizeof(session_rc));
+    mbedtls_platform_zeroize(session_pw3, sizeof(session_pw3));
+}
+
+static int openpgp_kdf_reseed_pin(uint16_t fid, const uint8_t *value, size_t value_len, uint8_t session[32]) {
+    file_t *pin = file_search_by_fid(fid, NULL, SPECIFY_EF);
+    uint16_t dek_fid = fid == EF_PW1 ? EF_DEK_PW1 : EF_DEK_PW3;
+    file_t *dek_file = file_search_by_fid(dek_fid, NULL, SPECIFY_EF);
+    uint8_t verifier[34];
+    uint8_t encrypted_dek[DEK_FILE_SIZE];
+    int r;
+
+    if (!pin || !dek_file || value_len > 127u) {
+        return PICOKEYS_ERR_FILE_NOT_FOUND;
+    }
+    verifier[0] = value_len;
+    verifier[1] = 0x1;
+    pin_derive_verifier(CONST_BYTE_ARRAY(value, value_len), verifier + 2);
+    pin_derive_session(CONST_BYTE_ARRAY(value, value_len), session);
+    encrypted_dek[0] = 0x3;
+    r = encrypt_with_aad(session, CONST_BYTE_ARRAY(dek, DEK_SIZE), PIN_KDF_DEFAULT_VERSION, encrypted_dek + 1);
+    if (r == PICOKEYS_OK) {
+        r = pin_txn_stage(fid, verifier, session);
+    }
+    if (r == PICOKEYS_OK) {
+        r = file_put_data(pin, CONST_BYTE_ARRAY(verifier, sizeof(verifier)));
+    }
+    if (r == PICOKEYS_OK) {
+        r = file_put_data(dek_file, CONST_BYTE_ARRAY(encrypted_dek, sizeof(encrypted_dek)));
+    }
+    if (r == PICOKEYS_OK) {
+        r = pin_txn_delete(fid);
+    }
+    if (r == PICOKEYS_OK) {
+        r = pin_reset_retries(pin, true);
+    }
+    mbedtls_platform_zeroize(verifier, sizeof(verifier));
+    mbedtls_platform_zeroize(encrypted_dek, sizeof(encrypted_dek));
+    return r;
+}
+
+int openpgp_kdf_update(const uint8_t *data, size_t len) {
+    const uint8_t *pw1 = NULL;
+    const uint8_t *pw3 = NULL;
+    uint8_t session_pw1_new[32] = { 0 };
+    uint8_t session_pw3_new[32] = { 0 };
+    size_t pw1_len = len == sizeof(openpgp_kdf_off) ? sizeof(openpgp_kdf_pw1_default) - 1 : 32;
+    size_t pw3_len = len == sizeof(openpgp_kdf_off) ? sizeof(openpgp_kdf_pw3_default) - 1 : 32;
+    file_t *kdf;
+    int r;
+
+    if (!has_pw3) {
+        return SW_SECURITY_STATUS_NOT_SATISFIED();
+    }
+    if (!openpgp_kdf_parse(data, len, &pw1, &pw3)) {
+        return SW_WRONG_DATA();
+    }
+    if (openpgp_kdf_key_present()) {
+        return SW_CONDITIONS_NOT_SATISFIED();
+    }
+    kdf = file_search_by_fid(EF_KDF, NULL, SPECIFY_EF);
+    if (!kdf) {
+        return SW_REFERENCE_NOT_FOUND();
+    }
+    if ((r = load_dek()) != PICOKEYS_OK) {
+        return SW_EXEC_ERROR();
+    }
+    if ((r = file_put_data(kdf, CONST_BYTE_ARRAY(data, len))) != PICOKEYS_OK) {
+        goto failure;
+    }
+    if ((r = openpgp_kdf_reseed_pin(EF_PW3, pw3, pw3_len, session_pw3_new)) != PICOKEYS_OK) {
+        goto failure;
+    }
+    if ((r = openpgp_kdf_reseed_pin(EF_PW1, pw1, pw1_len, session_pw1_new)) != PICOKEYS_OK) {
+        goto failure;
+    }
+    if ((r = openpgp_reset_code_deactivate()) != PICOKEYS_OK) {
+        goto failure;
+    }
+#ifdef ENABLE_ADMINLESS_MODE
+    if (len != sizeof(openpgp_kdf_off) && (r = openpgp_adminless_begin_kdf_migration()) != PICOKEYS_OK) {
+        goto failure;
+    }
+#endif
+    memcpy(session_pw1, session_pw1_new, sizeof(session_pw1));
+    memcpy(session_pw3, session_pw3_new, sizeof(session_pw3));
+    release_dek();
+    mbedtls_platform_zeroize(session_pw1_new, sizeof(session_pw1_new));
+    mbedtls_platform_zeroize(session_pw3_new, sizeof(session_pw3_new));
+    flash_commit();
+    return SW_OK();
+
+failure:
+    release_dek();
+    openpgp_kdf_clear_auth();
+    mbedtls_platform_zeroize(session_pw1_new, sizeof(session_pw1_new));
+    mbedtls_platform_zeroize(session_pw3_new, sizeof(session_pw3_new));
+    return SW_MEMORY_FAILURE();
+}
+
 int pin_txn_delete(uint16_t fid) {
     const file_object_txn_layout_t *layout = pin_txn_layout(fid);
     const file_object_authenticator_t *auth = openpgp_piv_object_manifest_authenticator();

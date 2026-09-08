@@ -71,6 +71,7 @@ extern bool piv_key_operation_authorized(uint16_t operation, bool internal_firmw
 extern int check_pin(const file_t *pin, const uint8_t *data, size_t len);
 extern int check_pin_len(uint16_t fid, size_t len);
 extern int openpgp_reset_code_deactivate(void);
+extern int openpgp_kdf_update(const uint8_t *data, size_t len);
 #ifdef ENABLE_ADMINLESS_MODE
 extern bool openpgp_adminless_is_pending(void);
 extern bool openpgp_adminless_is_active(void);

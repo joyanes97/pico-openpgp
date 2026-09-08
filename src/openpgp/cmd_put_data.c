@@ -89,6 +89,9 @@ int cmd_put_data(void) {
     if (!file_authenticate_action(ef, ACL_OP_UPDATE_ERASE)) {
         return SW_WRONG_P1P2();
     }
+    if (requested_fid == EF_KDF) {
+        return apdu.nc == 0 ? SW_WRONG_DATA() : openpgp_kdf_update(apdu.data, apdu.nc);
+    }
     if (fid == EF_PW_STATUS) {
         if (apdu.nc != 1 || apdu.data[0] > 1) {
             return SW_WRONG_DATA();
