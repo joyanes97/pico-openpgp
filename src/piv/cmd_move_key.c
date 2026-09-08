@@ -81,79 +81,113 @@ int cmd_move_key(void) {
         }
     }
 
+    file_t *ef_cert_from = file_search_by_fid(cert_from_fid, NULL, SPECIFY_EF);
+    file_t *ef_cert_to = NULL;
     if (to != 0xFF) {
-        if (meta_delete(to) != PICOKEYS_OK) {
-            return SW_MEMORY_FAILURE();
+        if (!(ef_cert_to = file_search_by_fid(cert_to_fid, NULL, SPECIFY_EF))) {
+            return SW_FILE_NOT_FOUND();
         }
-        uint8_t key_data[4096 / 8] = { 0 };
-        byte_buffer_t key = BYTE_BUFFER(key_data, sizeof(key_data));
-        int r = PICOKEYS_OK;
+    }
+
+    uint8_t key_data[4096 / 8] = { 0 };
+    byte_buffer_t key = BYTE_BUFFER(key_data, sizeof(key_data));
+    uint8_t cert_data[OPENPGP_MAX_OBJECT_SIZE] = { 0 };
+    uint16_t cert_len = 0;
+    bool has_cert = false;
+    uint8_t *meta_copy = NULL;
+    size_t meta_len = 0;
+    int status = SW_OK();
+    int r = PICOKEYS_OK;
+
+    if (to != 0xFF) {
         if (openpgp_key_container_is_marker(efs)) {
             r = openpgp_key_container_read_private(from, FILE_OBJECT_OPERATION_USE, true, &key);
         }
         else if (file_has_data(efs) && file_get_size(efs) <= sizeof(key_data)) {
             key.len = file_get_size(efs);
-            memcpy(key_data, file_get_data(efs), key.len);
+            r = file_read_at(efs, 0, BYTE_ARRAY(key_data, key.len));
         }
         else {
             r = PICOKEYS_WRONG_DATA;
         }
-        if (r == PICOKEYS_OK) {
-            r = openpgp_key_container_store(to, key_data, key.len, NULL, 0, true);
-        }
-        mbedtls_platform_zeroize(key_data, sizeof(key_data));
         if (r != PICOKEYS_OK) {
-            return SW_EXEC_ERROR();
+            status = SW_EXEC_ERROR();
+            goto cleanup;
         }
-    }
-
-    file_t *ef_cert_from = file_search_by_fid(cert_from_fid, NULL, SPECIFY_EF);
-    if (to != 0xFF) {
-        file_t *ef_cert_to = file_search_by_fid(cert_to_fid, NULL, SPECIFY_EF);
-        if (!ef_cert_to) {
-            return SW_FILE_NOT_FOUND();
+        if (ef_cert_from && file_has_data(ef_cert_from)) {
+            cert_len = (uint16_t)MIN(file_get_size(ef_cert_from), OPENPGP_MAX_OBJECT_SIZE);
+            if (file_read_at(ef_cert_from, 0, BYTE_ARRAY(cert_data, cert_len)) != PICOKEYS_OK) {
+                status = SW_MEMORY_FAILURE();
+                goto cleanup;
+            }
+            has_cert = true;
         }
-        if (file_has_data(ef_cert_from)) {
-            uint16_t cert_len = MIN(file_get_size(ef_cert_from), OPENPGP_MAX_OBJECT_SIZE);
-            file_put_data(ef_cert_to, CONST_BYTE_ARRAY(file_get_data(ef_cert_from), cert_len));
-        }
-        else {
-            flash_clear_file(ef_cert_to);
-        }
-    }
-    if (ef_cert_from) {
-        flash_clear_file(ef_cert_from);
-    }
-
-    byte_array_t metadata = meta_find(from);
-    uint8_t *meta_src = metadata.data;
-    size_t meta_len = metadata.len;
-    if (to != 0xFF) {
-        if (meta_len > 0 && meta_src != NULL) {
-            uint8_t *meta_copy = (uint8_t *)calloc(1, (size_t)meta_len);
+        byte_array_t metadata = meta_find(from);
+        if (metadata.len > 0) {
+            if (!metadata.data) {
+                status = SW_MEMORY_FAILURE();
+                goto cleanup;
+            }
+            meta_len = metadata.len;
+            meta_copy = (uint8_t *)calloc(1, meta_len);
             if (!meta_copy) {
-                return SW_MEMORY_FAILURE();
+                status = SW_MEMORY_FAILURE();
+                goto cleanup;
             }
-            memcpy(meta_copy, meta_src, (size_t)meta_len);
-            if (meta_add(to, CONST_BYTE_ARRAY(meta_copy, meta_len)) != PICOKEYS_OK) {
-                free(meta_copy);
-                return SW_MEMORY_FAILURE();
-            }
-            free(meta_copy);
+            memcpy(meta_copy, metadata.data, meta_len);
+        }
+
+        r = openpgp_key_container_store(to, key_data, key.len, NULL, 0, true);
+        if (r != PICOKEYS_OK) {
+            status = SW_EXEC_ERROR();
+            goto cleanup;
+        }
+        if (has_cert) {
+            r = file_put_data(ef_cert_to, CONST_BYTE_ARRAY(cert_data, cert_len));
         }
         else {
-            meta_delete(to);
+            r = flash_clear_file(ef_cert_to);
+        }
+        if (r != PICOKEYS_OK) {
+            status = SW_MEMORY_FAILURE();
+            goto cleanup;
+        }
+        if (meta_len > 0) {
+            r = meta_add(to, CONST_BYTE_ARRAY(meta_copy, meta_len));
+        }
+        else {
+            r = meta_delete(to);
+        }
+        if (r != PICOKEYS_OK) {
+            status = SW_MEMORY_FAILURE();
+            goto cleanup;
         }
     }
-    meta_delete(from);
+
+    r = meta_delete(from);
+    if (r != PICOKEYS_OK && r != PICOKEYS_ERR_FILE_NOT_FOUND) {
+        status = SW_MEMORY_FAILURE();
+        goto cleanup;
+    }
+    if (ef_cert_from && flash_clear_file(ef_cert_from) != PICOKEYS_OK) {
+        status = SW_MEMORY_FAILURE();
+        goto cleanup;
+    }
     if (openpgp_key_container_is_marker(efs)) {
         if (openpgp_key_container_delete(from, true) != PICOKEYS_OK) {
-            return SW_EXEC_ERROR();
+            status = SW_EXEC_ERROR();
+            goto cleanup;
         }
     }
-    else {
-        flash_clear_file(efs);
+    else if (flash_clear_file(efs) != PICOKEYS_OK) {
+        status = SW_EXEC_ERROR();
+        goto cleanup;
     }
     flash_commit();
-    return SW_OK();
+
+cleanup:
+    free(meta_copy);
+    mbedtls_platform_zeroize(key_data, sizeof(key_data));
+    mbedtls_platform_zeroize(cert_data, sizeof(cert_data));
+    return status;
 }
