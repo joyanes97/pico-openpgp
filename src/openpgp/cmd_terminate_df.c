@@ -36,6 +36,10 @@ static bool openpgp_terminate_preserve_fid(uint16_t fid) {
     return false;
 }
 
+static bool openpgp_terminate_defer_fid(uint16_t fid) {
+    return fid == EF_PW1 || fid == EF_RC || fid == EF_PW3 || fid == EF_PW_PRIV || fid == EF_PW_RETRIES || fid == EF_UIF_SIG || fid == EF_UIF_DEC || fid == EF_UIF_AUT || fid == EF_KDF || fid == EF_SIG_COUNT || fid == EF_SEX;
+}
+
 static bool openpgp_terminate_preserve_file(const file_t *file) {
     if (!file) {
         return false;
@@ -49,11 +53,15 @@ static bool openpgp_terminate_preserve_file(const file_t *file) {
 typedef struct openpgp_terminate_clear_context {
     int value;
     int metadata;
+    bool deferred;
 } openpgp_terminate_clear_context_t;
 
 static bool openpgp_terminate_clear_dynamic(file_t *file, void *ctx) {
     openpgp_terminate_clear_context_t *context = (openpgp_terminate_clear_context_t *)ctx;
     if (openpgp_terminate_preserve_file(file)) {
+        return true;
+    }
+    if (openpgp_terminate_defer_fid(file->fid) != context->deferred) {
         return true;
     }
     file_delete_result_t result = file_delete_no_commit_parts(file);
@@ -70,29 +78,33 @@ static bool openpgp_terminate_clear_dynamic(file_t *file, void *ctx) {
 static int openpgp_terminate_clear_storage(void) {
     openpgp_terminate_clear_context_t context = {
         .value = PICOKEYS_OK,
-        .metadata = PICOKEYS_OK
+        .metadata = PICOKEYS_OK,
+        .deferred = false
     };
     int r = openpgp_vault_clear_openpgp();
     if (r != PICOKEYS_OK) {
         context.value = r;
     }
     else {
-        for (file_entry_t *entry = file_entries; entry != file_last; entry++) {
-            file_t *file = &entry->file;
-            if (file->fid == 0 || openpgp_terminate_preserve_file(file) || !(file_get_type(file) & FILE_DATA_FLASH)) {
-                continue;
+        for (uint8_t phase = 0; phase < 2 && context.value == PICOKEYS_OK; phase++) {
+            context.deferred = phase != 0;
+            for (file_entry_t *entry = file_entries; entry != file_last; entry++) {
+                file_t *file = &entry->file;
+                if (file->fid == 0 || openpgp_terminate_preserve_file(file) || openpgp_terminate_defer_fid(file->fid) != context.deferred || !(file_get_type(file) & FILE_DATA_FLASH)) {
+                    continue;
+                }
+                file_delete_result_t result = file_delete_no_commit_parts(file);
+                if (context.metadata == PICOKEYS_OK && result.metadata != PICOKEYS_OK) {
+                    context.metadata = result.metadata;
+                }
+                if (result.value != PICOKEYS_OK) {
+                    context.value = result.value;
+                    break;
+                }
             }
-            file_delete_result_t result = file_delete_no_commit_parts(file);
-            if (context.metadata == PICOKEYS_OK && result.metadata != PICOKEYS_OK) {
-                context.metadata = result.metadata;
+            if (context.value == PICOKEYS_OK) {
+                file_for_each_dynamic(openpgp_terminate_clear_dynamic, &context);
             }
-            if (result.value != PICOKEYS_OK) {
-                context.value = result.value;
-                break;
-            }
-        }
-        if (context.value == PICOKEYS_OK) {
-            file_for_each_dynamic(openpgp_terminate_clear_dynamic, &context);
         }
     }
 
