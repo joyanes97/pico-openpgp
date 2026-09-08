@@ -20,6 +20,8 @@ You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
+import pytest
+
 from card_const import *
 from constants_for_test import *
 
@@ -32,3 +34,13 @@ class Test_Card_KDF_full(object):
     def test_kdf_put_full(self, card):
         r = card.configure_kdf(KDF_FULL)
         assert r
+
+    def test_kdf_rekeys_pin_references(self, card):
+        assert card.cmd_verify(1, KDF_FULL_HASH_PW1)
+        assert card.cmd_verify(3, KDF_FULL_HASH_PW3)
+
+    def test_kdf_disable_does_not_reset_custom_pin(self, card):
+        assert card.change_passwd(3, FACTORY_PASSPHRASE_PW3, PW3_TEST0)
+        with pytest.raises(ValueError, match="^6985$"):
+            card.cmd_put_data(0x00, 0xF9, b"\x81\x01\x00")
+        assert card.change_passwd(3, PW3_TEST0, FACTORY_PASSPHRASE_PW3)

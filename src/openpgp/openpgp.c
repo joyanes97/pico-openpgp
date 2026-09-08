@@ -597,6 +597,8 @@ static const openpgp_kdf_field_t openpgp_kdf_three_fields[] = {
     { 76, 0x88, 32 },
 };
 
+static int pin_reset_retries_internal(const file_t *pin, bool force, bool commit);
+
 static bool openpgp_kdf_parse(const uint8_t *data, size_t len, const uint8_t **pw1, const uint8_t **pw3) {
     const openpgp_kdf_field_t *fields = NULL;
     size_t field_count = 0;
@@ -632,16 +634,148 @@ static bool openpgp_kdf_parse(const uint8_t *data, size_t len, const uint8_t **p
     return *pw1 != NULL && *pw3 != NULL;
 }
 
-static bool openpgp_kdf_key_present(void) {
-    const uint16_t key_fids[] = { EF_PK_SIG, EF_PK_DEC, EF_PK_AUT };
+static bool openpgp_kdf_pin_is_factory_default(uint16_t fid, const uint8_t *value, size_t value_len) {
+    file_t *pin = file_search_by_fid(fid, NULL, SPECIFY_EF);
+    uint8_t verifier[34];
 
-    for (size_t i = 0; i < sizeof(key_fids) / sizeof(key_fids[0]); i++) {
-        file_t *key = file_search_by_fid(key_fids[i], NULL, SPECIFY_EF);
-        if (key && file_has_data(key)) {
-            return true;
-        }
+    if (!pin || !file_has_data(pin) || file_get_size(pin) != sizeof(verifier) || value_len > 127u) {
+        return false;
     }
-    return false;
+    verifier[0] = value_len;
+    verifier[1] = 0x1;
+    pin_derive_verifier(CONST_BYTE_ARRAY(value, value_len), verifier + 2);
+    return mbedtls_ct_memcmp(file_get_data(pin), verifier, sizeof(verifier)) == 0;
+}
+
+static bool openpgp_kdf_can_disable(void) {
+    file_t *kdf = file_search_by_fid(EF_KDF, NULL, SPECIFY_EF);
+    const uint8_t *pw1 = openpgp_kdf_pw1_default;
+    const uint8_t *pw3 = openpgp_kdf_pw3_default;
+    size_t pw1_len = sizeof(openpgp_kdf_pw1_default) - 1;
+    size_t pw3_len = sizeof(openpgp_kdf_pw3_default) - 1;
+
+    if (!kdf || !file_has_data(kdf) || file_get_size(kdf) == sizeof(openpgp_kdf_off)) {
+        return pin_is_factory_default(file_search_by_fid(EF_PW1, NULL, SPECIFY_EF), openpgp_kdf_pw1_default, pw1_len)
+            && pin_is_factory_default(file_search_by_fid(EF_PW3, NULL, SPECIFY_EF), openpgp_kdf_pw3_default, pw3_len);
+    }
+    else {
+        if (!openpgp_kdf_parse(file_get_data(kdf), file_get_size(kdf), &pw1, &pw3)) {
+            return false;
+        }
+        pw1_len = 32;
+        pw3_len = 32;
+    }
+    return openpgp_kdf_pin_is_factory_default(EF_PW1, pw1, pw1_len)
+        && openpgp_kdf_pin_is_factory_default(EF_PW3, pw3, pw3_len);
+}
+
+#define OPENPGP_KDF_SNAPSHOT_SIZE 128u
+
+typedef struct {
+    file_t *file;
+    uint8_t data[OPENPGP_KDF_SNAPSHOT_SIZE];
+    uint16_t len;
+    bool present;
+} openpgp_kdf_snapshot_file_t;
+
+typedef struct {
+    openpgp_kdf_snapshot_file_t kdf;
+    openpgp_kdf_snapshot_file_t pw1;
+    openpgp_kdf_snapshot_file_t pw3;
+    openpgp_kdf_snapshot_file_t dek_pw1;
+    openpgp_kdf_snapshot_file_t dek_pw3;
+    openpgp_kdf_snapshot_file_t rc;
+    openpgp_kdf_snapshot_file_t dek_rc;
+    openpgp_kdf_snapshot_file_t pw_status;
+    openpgp_kdf_snapshot_file_t pw_retries;
+} openpgp_kdf_snapshot_t;
+
+static int openpgp_kdf_snapshot_file(file_t *file, openpgp_kdf_snapshot_file_t *snapshot) {
+    snapshot->file = file;
+    snapshot->present = file_has_data(file);
+    snapshot->len = snapshot->present ? file_get_size(file) : 0;
+    if (snapshot->len > sizeof(snapshot->data)) {
+        return PICOKEYS_ERR_NO_MEMORY;
+    }
+    if (snapshot->present) {
+        return file_read_at(file, 0, BYTE_ARRAY(snapshot->data, snapshot->len));
+    }
+    return PICOKEYS_OK;
+}
+
+static int openpgp_kdf_snapshot_open(openpgp_kdf_snapshot_t *snapshot) {
+    int r = openpgp_kdf_snapshot_file(file_search_by_fid(EF_KDF, NULL, SPECIFY_EF), &snapshot->kdf);
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_file(file_search_by_fid(EF_PW1, NULL, SPECIFY_EF), &snapshot->pw1);
+    }
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_file(file_search_by_fid(EF_PW3, NULL, SPECIFY_EF), &snapshot->pw3);
+    }
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_file(file_search_by_fid(EF_DEK_PW1, NULL, SPECIFY_EF), &snapshot->dek_pw1);
+    }
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_file(file_search_by_fid(EF_DEK_PW3, NULL, SPECIFY_EF), &snapshot->dek_pw3);
+    }
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_file(file_search_by_fid(EF_RC, NULL, SPECIFY_EF), &snapshot->rc);
+    }
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_file(file_search_by_fid(EF_DEK_RC, NULL, SPECIFY_EF), &snapshot->dek_rc);
+    }
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_file(file_search_by_fid(EF_PW_PRIV, NULL, SPECIFY_EF), &snapshot->pw_status);
+    }
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_file(file_search_by_fid(EF_PW_RETRIES, NULL, SPECIFY_EF), &snapshot->pw_retries);
+    }
+    return r;
+}
+
+static int openpgp_kdf_snapshot_restore_file(const openpgp_kdf_snapshot_file_t *snapshot) {
+    if (!snapshot->file) {
+        return PICOKEYS_OK;
+    }
+    if (!snapshot->present) {
+        return flash_clear_file(snapshot->file);
+    }
+    return file_put_data(snapshot->file, CONST_BYTE_ARRAY(snapshot->data, snapshot->len));
+}
+
+static int openpgp_kdf_snapshot_restore(openpgp_kdf_snapshot_t *snapshot) {
+    int r = openpgp_kdf_snapshot_restore_file(&snapshot->kdf);
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_restore_file(&snapshot->pw1);
+    }
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_restore_file(&snapshot->pw3);
+    }
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_restore_file(&snapshot->dek_pw1);
+    }
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_restore_file(&snapshot->dek_pw3);
+    }
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_restore_file(&snapshot->rc);
+    }
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_restore_file(&snapshot->dek_rc);
+    }
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_restore_file(&snapshot->pw_status);
+    }
+    if (r == PICOKEYS_OK) {
+        r = openpgp_kdf_snapshot_restore_file(&snapshot->pw_retries);
+    }
+    if (r == PICOKEYS_OK) {
+        flash_commit();
+    }
+    return r;
+}
+
+static void openpgp_kdf_snapshot_clear(openpgp_kdf_snapshot_t *snapshot) {
+    mbedtls_platform_zeroize(snapshot, sizeof(*snapshot));
 }
 
 static void openpgp_kdf_clear_auth(void) {
@@ -685,7 +819,7 @@ static int openpgp_kdf_reseed_pin(uint16_t fid, const uint8_t *value, size_t val
         r = pin_txn_delete(fid);
     }
     if (r == PICOKEYS_OK) {
-        r = pin_reset_retries(pin, true);
+        r = pin_reset_retries_internal(pin, true, false);
     }
     mbedtls_platform_zeroize(verifier, sizeof(verifier));
     mbedtls_platform_zeroize(encrypted_dek, sizeof(encrypted_dek));
@@ -699,6 +833,7 @@ int openpgp_kdf_update(const uint8_t *data, size_t len) {
     uint8_t session_pw3_new[32] = { 0 };
     size_t pw1_len = len == sizeof(openpgp_kdf_off) ? sizeof(openpgp_kdf_pw1_default) - 1 : 32;
     size_t pw3_len = len == sizeof(openpgp_kdf_off) ? sizeof(openpgp_kdf_pw3_default) - 1 : 32;
+    openpgp_kdf_snapshot_t snapshot = { 0 };
     file_t *kdf;
     int r;
 
@@ -708,14 +843,19 @@ int openpgp_kdf_update(const uint8_t *data, size_t len) {
     if (!openpgp_kdf_parse(data, len, &pw1, &pw3)) {
         return SW_WRONG_DATA();
     }
-    if (openpgp_kdf_key_present()) {
+    if (len == sizeof(openpgp_kdf_off) && !openpgp_kdf_can_disable()) {
         return SW_CONDITIONS_NOT_SATISFIED();
     }
     kdf = file_search_by_fid(EF_KDF, NULL, SPECIFY_EF);
     if (!kdf) {
         return SW_REFERENCE_NOT_FOUND();
     }
+    if ((r = openpgp_kdf_snapshot_open(&snapshot)) != PICOKEYS_OK) {
+        openpgp_kdf_snapshot_clear(&snapshot);
+        return SW_MEMORY_FAILURE();
+    }
     if ((r = load_dek()) != PICOKEYS_OK) {
+        openpgp_kdf_snapshot_clear(&snapshot);
         return SW_EXEC_ERROR();
     }
     if ((r = file_put_data(kdf, CONST_BYTE_ARRAY(data, len))) != PICOKEYS_OK) {
@@ -740,12 +880,19 @@ int openpgp_kdf_update(const uint8_t *data, size_t len) {
     release_dek();
     mbedtls_platform_zeroize(session_pw1_new, sizeof(session_pw1_new));
     mbedtls_platform_zeroize(session_pw3_new, sizeof(session_pw3_new));
+    openpgp_kdf_snapshot_clear(&snapshot);
     flash_commit();
     return SW_OK();
 
 failure:
     release_dek();
     openpgp_kdf_clear_auth();
+    pin_txn_delete(EF_PW1);
+    pin_txn_delete(EF_PW3);
+    if (openpgp_kdf_snapshot_restore(&snapshot) == PICOKEYS_OK) {
+        scan_files_openpgp();
+    }
+    openpgp_kdf_snapshot_clear(&snapshot);
     mbedtls_platform_zeroize(session_pw1_new, sizeof(session_pw1_new));
     mbedtls_platform_zeroize(session_pw3_new, sizeof(session_pw3_new));
     return SW_MEMORY_FAILURE();
@@ -1157,7 +1304,7 @@ int set_atr(void) {
     return 0;
 }
 
-int pin_reset_retries(const file_t *pin, bool force) {
+static int pin_reset_retries_internal(const file_t *pin, bool force, bool commit) {
     if (!pin) {
         return PICOKEYS_ERR_NULL_PARAM;
     }
@@ -1179,8 +1326,14 @@ int pin_reset_retries(const file_t *pin, bool force) {
     uint8_t max_retries = file_get_data(pw_retries)[(pin->fid & 0xf)];
     p[3 + (pin->fid & 0xf)] = max_retries;
     int r = file_put_data(pw_status, CONST_BYTE_ARRAY(p, status_len));
-    flash_commit();
+    if (commit) {
+        flash_commit();
+    }
     return r;
+}
+
+int pin_reset_retries(const file_t *pin, bool force) {
+    return pin_reset_retries_internal(pin, force, true);
 }
 
 int pin_spend_retry(const file_t *pin, uint8_t *remaining) {
