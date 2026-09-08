@@ -46,19 +46,9 @@ static bool openpgp_terminate_preserve_file(const file_t *file) {
     return openpgp_terminate_preserve_fid(file->fid) || (file->fid >= 0xc400 && file->fid <= 0xc9ff);
 }
 
-static int openpgp_terminate_clear_file(file_t *file) {
-    if (!file || !file->data) {
-        return PICOKEYS_OK;
-    }
-    int r = meta_delete_no_commit(file->fid);
-    if (r != PICOKEYS_OK && r != PICOKEYS_ERR_FILE_NOT_FOUND) {
-        return r;
-    }
-    return flash_clear_file(file);
-}
-
 typedef struct openpgp_terminate_clear_context {
-    int result;
+    int value;
+    int metadata;
 } openpgp_terminate_clear_context_t;
 
 static bool openpgp_terminate_clear_dynamic(file_t *file, void *ctx) {
@@ -66,11 +56,22 @@ static bool openpgp_terminate_clear_dynamic(file_t *file, void *ctx) {
     if (openpgp_terminate_preserve_file(file)) {
         return true;
     }
-    context->result = openpgp_terminate_clear_file(file);
-    return context->result == PICOKEYS_OK;
+    file_delete_result_t result = file_delete_no_commit_parts(file);
+    if (context->metadata == PICOKEYS_OK && result.metadata != PICOKEYS_OK) {
+        context->metadata = result.metadata;
+    }
+    if (result.value != PICOKEYS_OK) {
+        context->value = result.value;
+        return false;
+    }
+    return true;
 }
 
 static int openpgp_terminate_clear_storage(void) {
+    openpgp_terminate_clear_context_t context = {
+        .value = PICOKEYS_OK,
+        .metadata = PICOKEYS_OK
+    };
     int r = openpgp_vault_clear_openpgp();
     if (r != PICOKEYS_OK) {
         return r;
@@ -81,16 +82,18 @@ static int openpgp_terminate_clear_storage(void) {
         if (file->fid == 0 || openpgp_terminate_preserve_file(file) || !(file_get_type(file) & FILE_DATA_FLASH)) {
             continue;
         }
-        r = openpgp_terminate_clear_file(file);
-        if (r != PICOKEYS_OK) {
-            return r;
+        file_delete_result_t result = file_delete_no_commit_parts(file);
+        if (context.metadata == PICOKEYS_OK && result.metadata != PICOKEYS_OK) {
+            context.metadata = result.metadata;
+        }
+        if (result.value != PICOKEYS_OK) {
+            return result.value;
         }
     }
 
-    openpgp_terminate_clear_context_t context = { .result = PICOKEYS_OK };
     file_for_each_dynamic(openpgp_terminate_clear_dynamic, &context);
-    if (context.result != PICOKEYS_OK) {
-        return context.result;
+    if (context.value != PICOKEYS_OK) {
+        return context.value;
     }
 
     flash_commit();
@@ -104,7 +107,7 @@ static int openpgp_terminate_clear_storage(void) {
     mbedtls_platform_zeroize(session_rc, sizeof(session_rc));
     mbedtls_platform_zeroize(session_pw3, sizeof(session_pw3));
     mbedtls_platform_zeroize(dek, sizeof(dek));
-    return PICOKEYS_OK;
+    return context.metadata;
 }
 
 int cmd_terminate_df(void) {
