@@ -21,6 +21,7 @@ along with this program.  If not, see <http://www.gnu.org/licenses/>.
 """
 
 from skip_if_no_kdf_support import *
+import pytest
 
 from card_const import *
 from constants_for_test import *
@@ -30,12 +31,12 @@ def test_verify_pw3(card):
     assert v
 
 def test_kdf_put_none(card):
-    if card.is_yubikey:
-        KDF_SETUP_NONE=b"\x81\x01\x00"
-    else:
-        KDF_SETUP_NONE=b""
-    r = card.configure_kdf(KDF_SETUP_NONE)
+    r = card.configure_kdf(b"\x81\x01\x00")
     assert r
+
+def test_kdf_rejects_empty_setup(card):
+    with pytest.raises(ValueError, match="^6700$"):
+        card.cmd_put_data(0x00, 0xf9, b"")
 
 def test_verify_pw3_1(card):
     v = card.verify(3, FACTORY_PASSPHRASE_PW3)

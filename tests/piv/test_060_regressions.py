@@ -1,6 +1,11 @@
+from datetime import datetime, timedelta, timezone
+
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
 from piv_helpers import DEFAULT_MANAGEMENT_KEY, DEFAULT_PIN, assert_apdu_error, delete_key
 from yubikit.core import Tlv
@@ -39,12 +44,34 @@ def test_piv_management_default_flag_includes_touch_policy(managed_piv):
 def test_piv_retired_key_can_move_to_active_slot(managed_piv):
     source = SLOT.RETIRED1
     target = SLOT.AUTHENTICATION
+    delete_key(managed_piv, source)
     delete_key(managed_piv, target)
     try:
-        managed_piv.generate_key(source, KEY_TYPE.ECCP256, PIN_POLICY.ONCE, TOUCH_POLICY.NEVER)
+        public_key = managed_piv.generate_key(source, KEY_TYPE.ECCP256, PIN_POLICY.ONCE, TOUCH_POLICY.NEVER)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Pico PIV move test")])
+        certificate = x509.CertificateBuilder().subject_name(name).issuer_name(name).public_key(public_key).serial_number(x509.random_serial_number()).not_valid_before(datetime.now(timezone.utc) - timedelta(minutes=1)).not_valid_after(datetime.now(timezone.utc) + timedelta(days=1)).sign(ec.generate_private_key(ec.SECP256R1()), hashes.SHA256())
+        managed_piv.put_certificate(source, certificate)
         managed_piv.move_key(source, target)
         assert managed_piv.get_slot_metadata(target).key_type == KEY_TYPE.ECCP256
+        assert managed_piv.get_certificate(target).public_bytes(serialization.Encoding.DER) == certificate.public_bytes(serialization.Encoding.DER)
         assert_apdu_error(lambda: managed_piv.get_slot_metadata(source), SW.REFERENCE_DATA_NOT_FOUND)
+        assert_apdu_error(lambda: managed_piv.get_certificate(source), 0x6A82)
+    finally:
+        delete_key(managed_piv, source)
+        delete_key(managed_piv, target)
+
+
+def test_piv_move_empty_source_preserves_target(managed_piv):
+    source = SLOT.RETIRED1
+    target = SLOT.AUTHENTICATION
+    delete_key(managed_piv, source)
+    delete_key(managed_piv, target)
+    try:
+        managed_piv.generate_key(target, KEY_TYPE.ECCP256, PIN_POLICY.ONCE, TOUCH_POLICY.NEVER)
+        with pytest.raises(ApduError) as raised:
+            managed_piv.move_key(source, target)
+        assert raised.value.sw == 0x6400
+        assert managed_piv.get_slot_metadata(target).key_type == KEY_TYPE.ECCP256
     finally:
         delete_key(managed_piv, source)
         delete_key(managed_piv, target)

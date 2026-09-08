@@ -84,10 +84,6 @@ class OpenPGP_Card(object):
             self.kdf_supported = True
 
     def configure_kdf(self, kdf_config):
-        old_kdf_iters = self.__kdf_iters
-        old_kdf_salt_user = self.__kdf_salt_user
-        old_kdf_salt_admin = self.__kdf_salt_admin
-
         self.kdf_data = kdf_config
         r = self.cmd_put_data(0x00, 0xf9, kdf_config)
         if self.kdf_data == b"" or self.kdf_data == b"\x81\x01\x00":
@@ -101,25 +97,6 @@ class OpenPGP_Card(object):
             self.__kdf_salt_user = salt_user
             self.__kdf_salt_reset = salt_reset
             self.__kdf_salt_admin = salt_admin
-
-        if not self.is_gnuk and not self.is_yubikey:
-            def kdf_value(pin, who, iterations, salt_user, salt_admin):
-                if not iterations:
-                    return pin
-                salt = salt_admin if who == 3 and salt_admin else salt_user
-                return kdf_calc(pin, salt, iterations)
-
-            old_pw1 = kdf_value(FACTORY_PASSPHRASE_PW1, 1,
-                                old_kdf_iters, old_kdf_salt_user, old_kdf_salt_admin)
-            new_pw1 = kdf_value(FACTORY_PASSPHRASE_PW1, 1,
-                                self.__kdf_iters, self.__kdf_salt_user, self.__kdf_salt_admin)
-            self.cmd_change_reference_data(1, old_pw1 + new_pw1)
-
-            old_pw3 = kdf_value(FACTORY_PASSPHRASE_PW3, 3,
-                                old_kdf_iters, old_kdf_salt_user, old_kdf_salt_admin)
-            new_pw3 = kdf_value(FACTORY_PASSPHRASE_PW3, 3,
-                                self.__kdf_iters, self.__kdf_salt_user, self.__kdf_salt_admin)
-            self.cmd_change_reference_data(3, old_pw3 + new_pw3)
         return r
 
     def save_algo_attribute(self, keyno, attr):
@@ -344,6 +321,12 @@ class OpenPGP_Card(object):
         if len(sw) != 2:
             raise ValueError(sw)
         if not (sw[0] == 0x90 and sw[1] == 0x00):
+            raise ValueError("%02x%02x" % (sw[0], sw[1]))
+        return True
+
+    def cmd_terminate_df(self):
+        sw = self.__reader.send_cmd(iso7816_compose(0xe6, 0x00, 0x00, b''))
+        if sw != b'\x90\x00':
             raise ValueError("%02x%02x" % (sw[0], sw[1]))
         return True
 

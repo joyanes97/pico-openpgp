@@ -31,3 +31,7 @@ class Test_Card_KDF_Single(object):
     def test_kdf_put_single(self, card):
         r = card.configure_kdf(KDF_SINGLE)
         assert r
+
+    def test_kdf_rekeys_pin_references(self, card):
+        assert card.cmd_verify(1, KDF_SINGLE_HASH_PW1)
+        assert card.cmd_verify(3, KDF_SINGLE_HASH_PW3)
