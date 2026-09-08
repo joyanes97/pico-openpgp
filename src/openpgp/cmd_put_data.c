@@ -89,6 +89,10 @@ int cmd_put_data(void) {
     if (!file_authenticate_action(ef, ACL_OP_UPDATE_ERASE)) {
         return SW_WRONG_P1P2();
     }
+    if ((requested_fid == EF_UIF_SIG || requested_fid == EF_UIF_DEC || requested_fid == EF_UIF_AUT) &&
+        file_has_data(ef) && file_get_data(ef)[0] == 0x02 && (apdu.nc == 0 || apdu.data[0] != 0x02)) {
+        return SW_CONDITIONS_NOT_SATISFIED();
+    }
     if (requested_fid == EF_KDF) {
         return apdu.nc == 0 ? SW_WRONG_DATA() : openpgp_kdf_update(apdu.data, apdu.nc);
     }
